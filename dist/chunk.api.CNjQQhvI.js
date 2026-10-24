@@ -1,0 +1,2 @@
+import{http as e}from"@pterodactyl/sdk";var t=`/api/admin/extensions/admin-roles/roles`,n=[`admin-roles`,`roles`];async function r(){let{data:n}=await e.get(t);return n}async function i(n){let{data:r}=await e.post(t,n);return r.attributes}async function a(n,r){let{data:i}=await e.put(`${t}/${n}`,r);return i.attributes}async function o(n){await e.delete(`${t}/${n}`)}export{a,n as i,o as n,r,i as t};
+//# sourceMappingURL=chunk.api.CNjQQhvI.js.map

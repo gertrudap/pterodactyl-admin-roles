@@ -1,0 +1,27 @@
+# Node and package-manager output
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# PHP dependencies and test caches
+vendor/
+.phpunit.result.cache
+.phpunit.cache/
+
+# Local environment and editor state
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Release packages belong in GitHub Releases, not commits.
+*.pteroext
+
+# Source maps are excluded from the distributable extension package.
+dist/**/*.map
+

@@ -1,0 +1,11 @@
+{
+    "description": "Delegated administrator roles for Pterodactyl Panel 2.",
+    "autoload": {
+        "psr-4": {
+            "AdminRoles\\": "src/"
+        }
+    },
+    "config": {
+        "autoloader-suffix": "AdminRolesExtension"
+    }
+}

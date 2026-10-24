@@ -1,0 +1,37 @@
+{
+    "$schema": "./node_modules/@pterodactyl/sdk/manifest.schema.json",
+    "id": "admin-roles",
+    "name": "Admin Roles",
+    "version": "1.0.0",
+    "description": "Delegated, least-privilege roles for the Pterodactyl 2 administration API.",
+    "icon": "shield-check",
+    "provider": "AdminRoles\\AdminRolesProvider",
+    "autoload": {
+        "AdminRoles\\": "src/"
+    },
+    "requires": {
+        "panel": ">=2.0.0-beta.2 <3.0",
+        "sdk": ">=2.0.0-beta.6 <3.0",
+        "php": "^8.3"
+    },
+    "ui": {
+        "entry": "dist/client.js",
+        "mode": "native",
+        "prefix": "ar",
+        "screens": [
+            {
+                "id": "roles",
+                "area": "admin",
+                "path": "roles",
+                "nav": {
+                    "label": "Roles",
+                    "icon": "shield-check",
+                    "order": 900
+                },
+                "when": {
+                    "runtime": true
+                }
+            }
+        ]
+    }
+}

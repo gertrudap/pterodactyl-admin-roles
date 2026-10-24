@@ -1,0 +1,248 @@
+diff --git a/app/Http/Middleware/Api/Admin/AuthenticateAdmin.php b/app/Http/Middleware/Api/Admin/AuthenticateAdmin.php
+index a865dc1..16788b6 100644
+--- a/app/Http/Middleware/Api/Admin/AuthenticateAdmin.php
++++ b/app/Http/Middleware/Api/Admin/AuthenticateAdmin.php
+@@ -9,6 +9,7 @@ use Illuminate\Http\Request;
+ use Laravel\Sanctum\Contracts\HasAbilities;
+ use Laravel\Sanctum\TransientToken;
+ use Pterodactyl\Models\ApiKey;
++use Pterodactyl\Models\User;
+ use Symfony\Component\HttpFoundation\Response;
+ use Symfony\Component\HttpKernel\Exception\AccessDeniedHttpException;
+ 
+@@ -26,7 +27,14 @@ class AuthenticateAdmin
+     public function handle(Request $request, Closure $next): mixed
+     {
+         $user = $request->user();
+-        throw_if(! $user || ! $user->root_admin, AccessDeniedHttpException::class, 'This action is unauthorized.');
++        $authorizer = app()->bound('admin-roles.authorizer') ? app('admin-roles.authorizer') : null;
++        $authorized = $user instanceof User && ($user->root_admin || (
++            is_object($authorizer)
++            && method_exists($authorizer, 'allows')
++            && $authorizer->allows($user, $request)
++        ));
++
++        throw_if(! $authorized, AccessDeniedHttpException::class, 'This action is unauthorized.');
+ 
+         $token = $user->currentAccessToken();
+         if ($token instanceof HasAbilities && ! $token instanceof TransientToken) {
+diff --git a/app/Http/Requests/Api/Admin/AdminApiRequest.php b/app/Http/Requests/Api/Admin/AdminApiRequest.php
+index cc40ec3..e6e5f05 100644
+--- a/app/Http/Requests/Api/Admin/AdminApiRequest.php
++++ b/app/Http/Requests/Api/Admin/AdminApiRequest.php
+@@ -23,15 +23,36 @@ abstract class AdminApiRequest extends ApiRequest
+ 
+     public function authorize(): bool
+     {
++        $user = $this->user();
++        if (! $user instanceof User) {
++            return false;
++        }
++
++        if ($user->root_admin) {
++            return true;
++        }
++
++        // A delegated administrator can never promote a user, or inspect, change,
++        // or delete an existing root administrator. Those operations would let a
++        // role outrank the built-in Administrator account.
++        $target = $this->route('user');
++        if (($target instanceof User && $target->root_admin) || ($this->has('root_admin') && $this->boolean('root_admin'))) {
++            return false;
++        }
++
+         $permissions = $this->permissions();
+ 
+-        // A request that declares no specific permissions still requires root administrator access.
++        // A request that declares no specific permissions remains root-only. Missing
++        // extension integration also fails closed rather than granting broad access.
+         if ($permissions === []) {
+-            return (bool) $this->user()->root_admin;
++            return false;
+         }
+ 
+         $abilities = array_map(fn (Permissions $permission) => $permission->value, $permissions);
++        $authorizer = app()->bound('admin-roles.authorizer') ? app('admin-roles.authorizer') : null;
+ 
+-        return $this->user()->can($abilities);
++        return is_object($authorizer)
++            && method_exists($authorizer, 'allowsPermissions')
++            && $authorizer->allowsPermissions($user, $abilities);
+     }
+ }
+diff --git a/app/Http/Resources/Api/Client/AccountResource.php b/app/Http/Resources/Api/Client/AccountResource.php
+index 77ad083..3a23741 100644
+--- a/app/Http/Resources/Api/Client/AccountResource.php
++++ b/app/Http/Resources/Api/Client/AccountResource.php
+@@ -19,9 +19,23 @@ class AccountResource extends ClientResource
+ 
+     public function toArray(Request $request): array
+     {
++        $adminAccess = $this->resource->root_admin;
++        $adminPermissions = $this->resource->root_admin ? ['*'] : [];
++        $authorizer = app()->bound('admin-roles.authorizer') ? app('admin-roles.authorizer') : null;
++
++        if (! $this->resource->root_admin && is_object($authorizer) && method_exists($authorizer, 'permissions')) {
++            $permissions = $authorizer->permissions($this->resource);
++            if (is_array($permissions)) {
++                $adminPermissions = $permissions;
++                $adminAccess = $permissions !== [];
++            }
++        }
++
+         return [
+             'id' => $this->resource->id,
+             'admin' => $this->resource->root_admin,
++            'admin_access' => $adminAccess,
++            'admin_permissions' => $adminPermissions,
+             'username' => $this->resource->username,
+             'email' => $this->resource->email,
+             'first_name' => $this->resource->name_first,
+diff --git a/app/Models/User.php b/app/Models/User.php
+index 0f7690f..9010cb1 100644
+--- a/app/Models/User.php
++++ b/app/Models/User.php
+@@ -110,10 +110,24 @@ class User extends Authenticatable implements Identifiable
+         $attributes = $this->toArray();
+         unset($attributes['id'], $attributes['external_id']);
+ 
++        $adminAccess = $this->root_admin;
++        $adminPermissions = $this->root_admin ? ['*'] : [];
++        $authorizer = app()->bound('admin-roles.authorizer') ? app('admin-roles.authorizer') : null;
++
++        if (! $this->root_admin && is_object($authorizer) && method_exists($authorizer, 'permissions')) {
++            $permissions = $authorizer->permissions($this);
++            if (is_array($permissions)) {
++                $adminPermissions = $permissions;
++                $adminAccess = $permissions !== [];
++            }
++        }
++
+         return [
+             ...$attributes,
+             'avatar' => $this->avatar_url,
+             'identifier' => $this->identifier,
++            'admin_access' => $adminAccess,
++            'admin_permissions' => $adminPermissions,
+         ];
+     }
+ 
+diff --git a/resources/scripts/api/account/queries.ts b/resources/scripts/api/account/queries.ts
+index 93a8aee..387a0cf 100644
+--- a/resources/scripts/api/account/queries.ts
++++ b/resources/scripts/api/account/queries.ts
+@@ -26,14 +26,25 @@ const getBootstrapCurrentUser = (): UserData => {
+ };
+ 
+ /** Keeps the fields the account endpoint does not return. */
+-const withAccount = (user: UserData, { attributes }: ClientUserResource): UserData => ({
+-    ...user,
+-    username: attributes.username,
+-    email: attributes.email,
+-    language: attributes.language,
+-    rootAdmin: attributes.admin,
+-    avatar: attributes.avatar,
+-});
++const withAccount = (user: UserData, { attributes }: ClientUserResource): UserData => {
++    // The generated OpenAPI type intentionally remains compatible with Panels that
++    // do not install Admin Roles, while the version-pinned core patch adds these.
++    const roleAware = attributes as typeof attributes & {
++        admin_access?: boolean;
++        admin_permissions?: readonly string[];
++    };
++
++    return {
++        ...user,
++        username: attributes.username,
++        email: attributes.email,
++        language: attributes.language,
++        rootAdmin: attributes.admin,
++        adminAccess: roleAware.admin_access ?? user.adminAccess ?? attributes.admin,
++        adminPermissions: roleAware.admin_permissions ?? user.adminPermissions ?? (attributes.admin ? ['*'] : []),
++        avatar: attributes.avatar,
++    };
++};
+ 
+ export const currentUserQueryOptions = () =>
+     queryOptions({
+diff --git a/resources/scripts/api/account/types.ts b/resources/scripts/api/account/types.ts
+index 1a96282..3315c31 100644
+--- a/resources/scripts/api/account/types.ts
++++ b/resources/scripts/api/account/types.ts
+@@ -4,6 +4,10 @@ export interface UserData {
+     email: string;
+     language: string;
+     rootAdmin: boolean;
++    /** True for a root Administrator or a user with an assigned delegated admin role. */
++    adminAccess?: boolean;
++    /** Root receives `*`; delegated users receive only explicit admin permission keys. */
++    adminPermissions?: readonly string[];
+     avatar?: string | null;
+     useTotp: boolean;
+     createdAt: Date;
+diff --git a/resources/scripts/bootstrap.ts b/resources/scripts/bootstrap.ts
+index 69b294b..4d1198a 100644
+--- a/resources/scripts/bootstrap.ts
++++ b/resources/scripts/bootstrap.ts
+@@ -33,6 +33,8 @@ interface ExtendedWindow extends Window {
+         username: string;
+         email: string;
+         root_admin: boolean;
++        admin_access?: boolean;
++        admin_permissions?: readonly string[];
+         use_totp: boolean;
+         language: string;
+         avatar?: string | null;
+@@ -52,6 +54,8 @@ export const getBootstrapUser = (): UserData | undefined => {
+               language: user.language,
+               avatar: user.avatar ?? null,
+               rootAdmin: user.root_admin,
++              adminAccess: user.admin_access ?? user.root_admin,
++              adminPermissions: user.admin_permissions ?? (user.root_admin ? ['*'] : []),
+               useTotp: user.use_totp,
+               createdAt: new Date(user.created_at),
+               updatedAt: new Date(user.updated_at),
+diff --git a/resources/scripts/router/routeTree.ts b/resources/scripts/router/routeTree.ts
+index 5f4036b..6f37c96 100644
+--- a/resources/scripts/router/routeTree.ts
++++ b/resources/scripts/router/routeTree.ts
+@@ -425,7 +425,7 @@ const panelRoute = createRoute({
+     beforeLoad: async ({ context }) => {
+         const user = await context.queryClient.ensureQueryData(currentUserQueryOptions());
+ 
+-        if (!user.rootAdmin) {
++        if (!user.rootAdmin && user.adminAccess !== true) {
+             throw new RouteAccessDenied('You do not have permission to access the administrative area.');
+         }
+     },
+diff --git a/resources/scripts/views/layouts.ts b/resources/scripts/views/layouts.ts
+index e3d0728..e0a7dbd 100644
+--- a/resources/scripts/views/layouts.ts
++++ b/resources/scripts/views/layouts.ts
+@@ -255,7 +255,7 @@ function useAppArea(): AppArea {
+ 
+ function useAppLayoutModel(): AppLayoutModel {
+     const brand = useBrand();
+-    const { uuid, username, email, avatar, rootAdmin } = useCurrentUser();
++    const { uuid, username, email, avatar, rootAdmin, adminAccess } = useCurrentUser();
+     const { scheme, preference, schemes, setScheme } = useTheme();
+     const { mutate, isPending } = useLogout();
+     const area = useAppArea();
+@@ -263,7 +263,7 @@ function useAppLayoutModel(): AppLayoutModel {
+     return useMemo(
+         () => ({
+             brand,
+-            links: appLinks(rootAdmin),
++            links: appLinks(rootAdmin || adminAccess === true),
+             area,
+             user: { uuid, username, email, avatar: avatar ?? null, rootAdmin },
+             scheme,
+@@ -281,6 +281,7 @@ function useAppLayoutModel(): AppLayoutModel {
+             email,
+             avatar,
+             rootAdmin,
++            adminAccess,
+             scheme,
+             preference,
+             schemes,
+
